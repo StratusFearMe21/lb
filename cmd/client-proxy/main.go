@@ -4,18 +4,26 @@ import (
 	"flag"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/matrix-org/lb/mobile"
+	"github.com/sirupsen/logrus"
 )
 
 var (
-	httpBindAddr   = flag.String("http-bind-addr", ":8008", "The HTTP listening port for the server")
-	homeserverAddr = flag.String("homeserver", "", "The homeserver to forward inbound requests to, without the coaps:// e.g localhost:8008")
+	httpBindAddr                                      = flag.String("http-bind-addr", ":8008", "The HTTP listening port for the server")
+	homeserverAddr                                    = flag.String("homeserver", "", "The homeserver to forward inbound requests to, without the coaps:// e.g localhost:8008")
+	homeserverRoot             *url.URL               = nil
+	mediaProxy                 *httputil.ReverseProxy = nil
+	mediaUrlRegexp, regexp_err                        = regexp.Compile("/_matrix/(client|federation)/v1/media")
 )
 
 func mustInt(val string) int {
@@ -81,6 +89,11 @@ func setConnParamsFromEnv() {
 }
 
 func handler(w http.ResponseWriter, req *http.Request) {
+	if mediaUrlRegexp.MatchString(req.URL.Path) {
+		req.Host = homeserverRoot.Host
+		mediaProxy.ServeHTTP(w, req)
+		return
+	}
 	reqURL := req.URL
 	reqURL.Host = *homeserverAddr
 	token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
@@ -108,6 +121,15 @@ func handler(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
+	lvl, ok := os.LookupEnv("LOG_LEVEL")
+	if !ok {
+		lvl = "debug"
+	}
+	ll, err := logrus.ParseLevel(lvl)
+	if err != nil {
+		ll = logrus.DebugLevel
+	}
+	logrus.SetLevel(ll)
 	setConnParamsFromEnv()
 	flag.Parse()
 	if *homeserverAddr == "" {
@@ -116,6 +138,16 @@ func main() {
 	if *httpBindAddr == "" {
 		log.Fatal("--http-bind-addr must be set")
 	}
+
+	homeserverRootHost, _, err := net.SplitHostPort(*homeserverAddr)
+	if err != nil {
+		log.Fatalf("`%s` not a valid host: %v", *homeserverAddr, err)
+	}
+	homeserverRoot, err := url.Parse("https://" + homeserverRootHost)
+	if err != nil {
+		log.Fatalf("`https://%s` not a valid URL: %v", homeserverRootHost, err)
+	}
+	mediaProxy = httputil.NewSingleHostReverseProxy(homeserverRoot)
 
 	http.HandleFunc("/", handler)
 
